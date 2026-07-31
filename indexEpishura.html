@@ -1,0 +1,749 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Отчет по сотрудникам</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css" />
+  
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+  <!-- Подключаем русскую локаль для flatpickr -->
+  <script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/l10n/ru.js"></script>
+  
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.4/moment.min.js"></script>
+  
+  <!-- Отключаем Sentry -->
+  <script>
+    window.Sentry = {
+      init: function() {},
+      captureEvent: function() {},
+      captureMessage: function() {}
+    };
+  </script>
+  
+  <!-- Переопределяем BroadcastChannel для подавления ошибок -->
+  <script>
+    if (window.BroadcastChannel) {
+      const OriginalBroadcastChannel = window.BroadcastChannel;
+      window.BroadcastChannel = function(name) {
+        const channel = new OriginalBroadcastChannel(name);
+        const originalPostMessage = channel.postMessage.bind(channel);
+        channel.postMessage = function(msg) {
+          try {
+            originalPostMessage(msg);
+          } catch (e) {
+            console.warn('BroadcastChannel postMessage error suppressed:', e);
+          }
+        };
+        return channel;
+      };
+    }
+  </script>
+  
+  <!-- Скрипт Bitrix24 -->
+  <script src="https://api.bitrix24.com/api/v1/"></script>
+</head>
+<body>
+  <!-- Опционально можно добавить блок глобального редактирования плана для каждого показателя -->
+  <div class="container p-4" id="globalPlanBlock" style="display: none; margin-bottom: 20px;">
+    <h4>Установить общий план для всех показателей</h4>
+    <!-- Пример: два поля для звонков -->
+    <div class="row">
+      <div class="col">
+        <label for="globalCallsPlan">Звонки</label>
+        <input type="text" id="globalCallsPlan" class="form-control" placeholder="План звонков">
+      </div>
+      <div class="col">
+        <label for="globalSuccessCallsPlan">Успешные звонки</label>
+        <input type="text" id="globalSuccessCallsPlan" class="form-control" placeholder="План успешных звонков">
+      </div>
+      <!-- Можно добавить и для остальных показателей -->
+    </div>
+    <button class="btn btn-success mt-2" id="setGlobalPlans">Применить глобальные планы</button>
+  </div>
+  
+  <div class="report-wrapper">
+    <div class="container p-4">
+      <h2 class="text-center mb-4">📊 Отчет по сотрудникам</h2>
+      
+      <!-- Сообщение об авторизации -->
+      <div id="authStatus" class="alert alert-info" style="display: none;"></div>
+      
+      <!-- Фильтры -->
+      <div class="d-flex flex-nowrap align-items-center mb-3">
+        <div class="me-3 flex-grow-1">
+          <span class="fw-bold">Выберите дату или диапазон:</span>
+          <input type="text" id="datePicker" class="form-control" placeholder="Нажмите для выбора даты" />
+        </div>
+        <div class="me-3 flex-grow-1">
+          <span class="fw-bold">Выберите менеджеров:</span>
+          <div class="dropdown">
+            <button class="form-select dropdown-toggle" type="button" id="managerDropdownButton" data-bs-toggle="dropdown" aria-expanded="false">
+              Выберите менеджеров
+            </button>
+            <div class="dropdown-menu p-2" id="managerDropdownMenu"></div>
+          </div>
+        </div>
+        <div class="flex-grow-1">
+          <span class="fw-bold">🏢 Отдел:</span>
+          <select id="departmentSelect" class="form-select">
+            <option value="">Все</option>
+          </select>
+        </div>
+      </div>
+      <div id="selectedManagersDisplay" class="mb-2 text-center"></div>
+      <div class="mb-2 text-center" id="refreshTimer">
+        Следующее обновление через: <span id="timerCount">420</span> сек
+      </div>
+      <div class="d-flex justify-content-center mb-4">
+        <button class="btn btn-primary btn-sm" id="generateReport">📥 Сформировать отчет</button>
+      </div>
+      <div id="loader" class="loader mb-4" style="display: none;">⏳ Загружаем данные...</div>
+      <div>
+        <table class="table table-striped">
+          <thead class="table-dark">
+            <tr>
+              <th>Менеджер</th>
+              <th>Звонки</th>
+              <th>Успешные звонки</th>
+              <th>Время звонков</th>
+              <th>Новые лиды</th>
+              <th>Отправлено КП</th>
+              <th>Договор</th>
+              <th>Размещение на сайте</th>
+              <th>Тех.обучение</th>
+              <th>1-я продажа</th>
+            </tr>
+          </thead>
+          <tbody id="reportTable"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  
+  <script>
+    // Разрешенные id пользователей для редактирования плана
+    const allowedPlanEditors = [31, 37];
+    let currentUserId = null;
+    
+    // Получаем данные текущего пользователя через BX24.getAuth
+    BX24.init(function(){
+      BX24.getAuth().then(authData => {
+        currentUserId = Number(authData.user_id);
+        console.log("Текущий пользователь:", currentUserId);
+        if (allowedPlanEditors.includes(currentUserId)) {
+          document.getElementById('globalPlanBlock').style.display = 'block';
+        }
+      });
+    });
+    
+    const WEBHOOK_URL = ''
+    
+    function objectToSearchParams(obj) {
+      const params = new URLSearchParams();
+      for (const key in obj) {
+        if (obj.hasOwnProperty(key)) {
+          const value = obj[key];
+          if (Array.isArray(value)) {
+            value.forEach(v => params.append(key + "[]", v));
+          } else if (typeof value === 'object' && value !== null) {
+            for (const subKey in value) {
+              if (value.hasOwnProperty(subKey)) {
+                params.append(`${key}[${subKey}]`, value[subKey]);
+              }
+            }
+          } else {
+            params.append(key, value);
+          }
+        }
+      }
+      return params;
+    }
+    
+    async function callWebhook(method, params = {}) {
+      const url = WEBHOOK_URL + method + '.json';
+      const body = objectToSearchParams(params);
+      console.log(`Вызов ${method} с параметрами:`, params);
+      try {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: body.toString()
+        });
+        if (!response.ok) {
+          throw new Error('Ошибка сети: ' + response.statusText);
+        }
+        const json = await response.json();
+        console.log(`Ответ ${method}:`, json);
+        return json;
+      } catch (error) {
+        console.error('Ошибка вызова вебхука', error);
+        throw error;
+      }
+    }
+    
+    async function getStageMapping() {
+      try {
+        const response0 = await callWebhook('crm.status.list', { filter: { ENTITY_ID: 'DEAL_STAGE' } });
+        const response1 = await callWebhook('crm.status.list', { filter: { ENTITY_ID: 'DEAL_STAGE_1' } });
+        const mapping = {};
+        function addStages(data) {
+          (data.result || []).forEach(stage => {
+            if (stage && stage.NAME && stage.STATUS_ID) {
+              const key = stage.NAME.trim().toLowerCase().normalize('NFKC');
+              if (!mapping[key]) mapping[key] = [];
+              mapping[key].push(stage.STATUS_ID);
+            }
+          });
+        }
+        addStages(response0);
+        addStages(response1);
+        console.log("Сформированный mapping стадий (воронки 0 и 1):", mapping);
+        return mapping;
+      } catch (error) {
+        console.error("Ошибка загрузки стадий:", error);
+        return {};
+      }
+    }
+    
+    function getDealsForStage(stageName, stageMapping) {
+      const normalizedStage = stageName.trim().toLowerCase().normalize('NFKC');
+      const mappingKey = Object.keys(stageMapping).find(key => key === normalizedStage);
+      if (mappingKey) {
+        return stageMapping[mappingKey];
+      }
+      console.warn(`Стадия с именем "${stageName}" не найдена`);
+      return null;
+    }
+    
+    async function getAllDealsForManager(userID) {
+      let allDeals = [];
+      let start = 0;
+      while (true) {
+        const response = await callWebhook('crm.deal.list', {
+          filter: { "ASSIGNED_BY_ID": userID },
+          select: ["ID"],
+          start,
+          NAV_PARAMS: { nPageSize: 50 }
+        });
+        if (response.result && Array.isArray(response.result)) {
+          allDeals = allDeals.concat(response.result.map(deal => deal.ID));
+        }
+        if (!response.next) break;
+        start = response.next;
+      }
+      console.log(`Сделки для пользователя ${userID}:`, allDeals);
+      return allDeals;
+    }
+    
+    async function getDealsCountForStageUsingBatch(userID, stageName, dates, stageMapping, dealIDs) {
+      const stageCode = getDealsForStage(stageName, stageMapping);
+      if (!stageCode) return 0;
+      const dateStart = moment(dates[0], "DD.MM.YYYY").startOf('day').utcOffset(180, true).format("YYYY-MM-DDTHH:mm:ssZ");
+      const dateEnd = moment(dates[1], "DD.MM.YYYY").endOf('day').utcOffset(180, true).format("YYYY-MM-DDTHH:mm:ssZ");
+      function chunkArray(array, size) {
+        const chunks = [];
+        for (let i = 0; i < array.length; i += size) {
+          chunks.push(array.slice(i, i + size));
+        }
+        return chunks;
+      }
+      const chunks = chunkArray(dealIDs, 50);
+      let cmd = {};
+      let index = 0;
+      for (let chunk of chunks) {
+        let query = `crm.stagehistory.list?entityTypeId=2`;
+        if (Array.isArray(stageCode)) {
+          stageCode.forEach(code => {
+            query += `&filter[STAGE_ID][]=${encodeURIComponent(code)}`;
+          });
+        } else {
+          query += `&filter[STAGE_ID]=${encodeURIComponent(stageCode)}`;
+        }
+        query += `&filter[>=CREATED_TIME]=${encodeURIComponent(dateStart)}`;
+        query += `&filter[<=CREATED_TIME]=${encodeURIComponent(dateEnd)}`;
+        chunk.forEach(id => {
+          query += `&filter[OWNER_ID][]=${encodeURIComponent(id)}`;
+        });
+        console.log(`Сформированный запрос для batch (q${index}):`, query);
+        cmd[`q${index}`] = query;
+        index++;
+      }
+      try {
+        const batchResponse = await callWebhook('batch', { halt: 0, cmd });
+        console.log("Batch ответ:", batchResponse);
+        let uniqueDeals = new Set();
+        const batchResult = batchResponse.result.result;
+        for (let key in batchResult) {
+          let subResult = batchResult[key];
+          if (subResult.items && Array.isArray(subResult.items)) {
+            subResult.items.forEach(record => {
+              if (record.CREATED_TIME) {
+                let created = moment(record.CREATED_TIME);
+                if (created.isSameOrAfter(dateStart) && created.isSameOrBefore(dateEnd)) {
+                  uniqueDeals.add(record.OWNER_ID);
+                }
+              }
+            });
+          }
+        }
+        const count = uniqueDeals.size;
+        console.log(`Количество сделок для стадии "${stageName}" (код(ы): ${Array.isArray(stageCode) ? stageCode.join(", ") : stageCode}) для пользователя ${userID}:`, count);
+        return count;
+      } catch (e) {
+        console.error("Ошибка выполнения batch запроса для стадии", stageName, e);
+        return 0;
+      }
+    }
+    
+    async function getNewLeadsCount(userID, dates) {
+      const dateStart = moment(dates[0], "DD.MM.YYYY").startOf('day').utcOffset(180, true).format("YYYY-MM-DDTHH:mm:ssZ");
+      const dateEnd = moment(dates[1], "DD.MM.YYYY").endOf('day').utcOffset(180, true).format("YYYY-MM-DDTHH:mm:ssZ");
+      async function getCountForPipeline(pipelineId) {
+        let count = 0;
+        let start = 0;
+        while (true) {
+          const response = await callWebhook('crm.deal.list', {
+            filter: {
+              "ASSIGNED_BY_ID": userID,
+              ">=DATE_CREATE": dateStart,
+              "<=DATE_CREATE": dateEnd,
+              "CATEGORY_ID": pipelineId
+            },
+            select: ["ID"],
+            start,
+            NAV_PARAMS: { nPageSize: 50 }
+          });
+          if (response.result && Array.isArray(response.result)) {
+            count += response.result.length;
+          }
+          if (!response.next) break;
+          start = response.next;
+        }
+        return count;
+      }
+      const count0 = await getCountForPipeline(0);
+      const count1 = await getCountForPipeline(1);
+      console.log(`Новые лиды для пользователя ${userID}: воронка 0 = ${count0}, воронка 1 = ${count1}`);
+      return count0 + count1;
+    }
+    
+    async function getTotalCalls(userID, dates) {
+      const callsStart = moment(dates[0], "DD.MM.YYYY").startOf('day').utcOffset(180, true).format("YYYY-MM-DDTHH:mm:ssZ");
+      const callsEnd = moment(dates[1], "DD.MM.YYYY").endOf('day').utcOffset(180, true).format("YYYY-MM-DDTHH:mm:ssZ");
+      try {
+        const response = await callWebhook('voximplant.statistic.get', {
+          filter: {
+            "PORTAL_USER_ID": userID,
+            ">=CALL_START_DATE": callsStart,
+            "<=CALL_START_DATE": callsEnd
+          }
+        });
+        const count = response.total !== undefined ? response.total : (response.result ? response.result.length : 0);
+        console.log(`Общее число звонков для пользователя ${userID}:`, count);
+        return count;
+      } catch (error) {
+        console.error("Ошибка при получении общего числа звонков:", error);
+        return 0;
+      }
+    }
+    
+    async function getSuccessfulCalls(userID, dates) {
+      const callsStart = moment(dates[0], "DD.MM.YYYY").startOf('day').utcOffset(180, true).format("YYYY-MM-DDTHH:mm:ssZ");
+      const callsEnd = moment(dates[1], "DD.MM.YYYY").endOf('day').utcOffset(180, true).format("YYYY-MM-DDTHH:mm:ssZ");
+      try {
+        const response = await callWebhook('voximplant.statistic.get', {
+          filter: {
+            "PORTAL_USER_ID": userID,
+            ">=CALL_START_DATE": callsStart,
+            "<=CALL_START_DATE": callsEnd,
+            ">=CALL_DURATION": 30
+          }
+        });
+        const count = response.total !== undefined ? response.total : (response.result ? response.result.length : 0);
+        console.log(`Число успешных звонков (>=30 сек) для пользователя ${userID}:`, count);
+        return count;
+      } catch (error) {
+        console.error("Ошибка при получении звонков с длительностью > 30 сек:", error);
+        return 0;
+      }
+    }
+    
+    async function getTotalCallDuration(userID, dates) {
+      const callsStart = moment(dates[0], "DD.MM.YYYY").startOf('day').utcOffset(180, true).format("YYYY-MM-DDTHH:mm:ssZ");
+      const callsEnd = moment(dates[1], "DD.MM.YYYY").endOf('day').utcOffset(180, true).format("YYYY-MM-DDTHH:mm:ssZ");
+      let totalDuration = 0;
+      let start = 0;
+      try {
+        while (true) {
+          const response = await callWebhook('voximplant.statistic.get', {
+            filter: {
+              "PORTAL_USER_ID": userID,
+              ">=CALL_START_DATE": callsStart,
+              "<=CALL_START_DATE": callsEnd
+            },
+            start,
+            NAV_PARAMS: { nPageSize: 500 }
+          });
+          if (response.result && Array.isArray(response.result)) {
+            response.result.forEach(call => {
+              totalDuration += Number(call.CALL_DURATION) || 0;
+            });
+          }
+          if (!response.next) break;
+          start = response.next;
+        }
+        console.log(`Суммарная длительность звонков для пользователя ${userID}:`, totalDuration);
+        return totalDuration;
+      } catch (error) {
+        console.error("Ошибка при подсчете суммарной длительности звонков:", error);
+        return 0;
+      }
+    }
+    
+    function formatCallTime(totalSeconds) {
+      totalSeconds = Number(totalSeconds) || 0;
+      const minutes = Math.floor(totalSeconds / 60);
+      const seconds = totalSeconds % 60;
+      return `${minutes} мин ${seconds} сек`;
+    }
+    
+    // Массив метрик (показателей) – для каждого будет как факт, так и план.
+    // Порядок должен соответствовать заголовкам таблицы.
+    const metrics = [
+      { key: "calls", title: "Звонки" },
+      { key: "success_calls", title: "Успешные звонки" },
+      { key: "calls_time", title: "Время звонков" },
+      { key: "not_sorted", title: "Новые лиды" },
+      { key: "otpravleno_kp", title: "Отправлено КП" },
+      { key: "dogovor", title: "Договор" },
+      { key: "razmeshenie", title: "Размещение на сайте" },
+      { key: "tech_training", title: "Тех.обучение" },
+      { key: "first_sale", title: "1я продажа" }
+    ];
+    
+    const app = {
+      allManagers: [],
+      allDepartments: [],
+      items: [],
+      dates: [],
+      selectedUsers: [],
+      timer: 420,
+      // Используем metrics вместо dealStages для удобства
+      metrics: metrics,
+    
+      async init() {
+        this.initDatePicker();
+        this.bindEvents();
+        await this.initBX24();
+        await this.initDepartmentsSelect();
+        await this.initManagers();
+        this.stageMapping = await getStageMapping();
+        console.log("StageMapping итог:", this.stageMapping);
+    
+        setInterval(() => {
+          if (this.timer > 0) this.timer--;
+          document.getElementById('timerCount').textContent = this.timer;
+        }, 1000);
+      },
+    
+      initDatePicker() {
+        flatpickr("#datePicker", {
+          mode: "range",
+          dateFormat: "Y-m-d",
+          locale: flatpickr.l10ns.ru,
+          allowInput: true,
+          defaultDate: new Date(),
+          onChange: (selectedDates) => { this.dates = selectedDates; },
+          onReady: (selectedDates) => { this.dates = selectedDates; }
+        });
+      },
+    
+      bindEvents() {
+        document.getElementById('generateReport').addEventListener('click', () => this.createReport());
+        document.getElementById('departmentSelect').addEventListener('change', (e) => this.handleDepartmentChange(e));
+      },
+    
+      async initBX24() {
+        return new Promise((resolve) => {
+          BX24.init(() => { console.log("BX24 инициализирован"); resolve(); });
+        });
+      },
+    
+      async loadDepartments() {
+        return new Promise((resolve, reject) => {
+          BX24.callMethod("department.get", {}, (result) => {
+            if (result.error()) {
+              reject(result.error());
+              return;
+            }
+            resolve(result.data());
+          });
+        });
+      },
+    
+      async loadUsers() {
+        return new Promise((resolve, reject) => {
+          BX24.callMethod("user.get", {}, (result) => {
+            if (result.error()) {
+              reject(result.error());
+              return;
+            }
+            const activeUsers = result.data().filter(user => user.ACTIVE === true);
+            resolve(activeUsers);
+          });
+        });
+      },
+    
+      async initDepartmentsSelect() {
+        try {
+          this.allDepartments = await this.loadDepartments();
+          const select = document.getElementById('departmentSelect');
+          this.allDepartments.forEach(dept => {
+            const option = document.createElement('option');
+            option.value = dept.ID;
+            option.textContent = dept.NAME;
+            select.appendChild(option);
+          });
+        } catch (error) {
+          console.error('Ошибка загрузки отделов:', error);
+        }
+      },
+    
+      async handleDepartmentChange(event) {
+        const departmentId = event.target.value;
+        this.updateManagersList(departmentId);
+      },
+    
+      updateManagersList(departmentId = null) {
+        const filtered = departmentId
+          ? this.allManagers.filter(user =>
+              Array.isArray(user.UF_DEPARTMENT)
+                ? user.UF_DEPARTMENT.includes(Number(departmentId))
+                : user.UF_DEPARTMENT === Number(departmentId))
+          : this.allManagers;
+        const container = document.getElementById('managerDropdownMenu');
+        container.innerHTML = '';
+        filtered.forEach(user => {
+          const div = document.createElement('div');
+          div.classList.add('form-check');
+          div.innerHTML = `
+            <input class="form-check-input manager-checkbox" type="checkbox" value="${user.ID}" id="mgr_${user.ID}" checked>
+            <label class="form-check-label" for="mgr_${user.ID}">${user.NAME} ${user.LAST_NAME}</label>
+          `;
+          container.appendChild(div);
+        });
+        document.querySelectorAll('.manager-checkbox').forEach(cb => {
+          cb.addEventListener('change', () => this.displaySelectedManagers());
+        });
+        this.displaySelectedManagers();
+      },
+    
+      displaySelectedManagers() {
+        const checkboxes = document.querySelectorAll('.manager-checkbox');
+        const selected = Array.from(checkboxes)
+          .filter(checkbox => checkbox.checked)
+          .map(checkbox => this.allManagers.find(user => user.ID == checkbox.value))
+          .filter(user => user !== undefined);
+        this.selectedUsers = selected;
+        const names = selected.map(user => `${user.NAME} ${user.LAST_NAME}`).join(', ');
+        const displayBlock = document.getElementById('selectedManagersDisplay');
+        displayBlock.textContent = names ? 'Выбраны: ' + names : '';
+      },
+    
+      async initManagers() {
+        try {
+          this.allManagers = await this.loadUsers();
+          this.updateManagersList();
+        } catch (error) {
+          console.error('Ошибка загрузки пользователей:', error);
+        }
+      },
+    
+      formatDate(dates) {
+        if (!dates || dates.length < 2) {
+          const today = moment().format("DD.MM.YYYY");
+          return [today, today];
+        }
+        return [moment(dates[0]).format("DD.MM.YYYY"), moment(dates[1]).format("DD.MM.YYYY")];
+      },
+    
+      async createReport() {
+        try {
+          document.getElementById('loader').style.display = 'block';
+          const needleUsers = this.selectedUsers.length ? this.selectedUsers : this.allManagers;
+          const displayDates = this.formatDate(this.dates);
+          console.log("Выбранные даты:", displayDates);
+    
+          const itemsPromises = needleUsers.map(async manager => {
+            const userID = manager.ID;
+            const totalCalls = await getTotalCalls(userID, displayDates);
+            const successfulCalls = await getSuccessfulCalls(userID, displayDates);
+            const totalCallDuration = await getTotalCallDuration(userID, displayDates);
+            const newLeads = await getNewLeadsCount(userID, displayDates);
+            const dealIDs = await getAllDealsForManager(userID);
+            // Получаем показатели для каждого метрика через batch
+            const metricsPromises = this.metrics.map(metric =>
+              getDealsCountForStageUsingBatch(userID, metric.title, displayDates, this.stageMapping, dealIDs)
+            );
+            const metricsValues = await Promise.all(metricsPromises);
+    
+            console.log(`Менеджер ${manager.NAME} ${manager.LAST_NAME}:`, {
+              totalCalls,
+              successfulCalls,
+              totalCallDuration,
+              newLeads,
+              metricsValues
+            });
+    
+            // Формируем объект с фактами и планами (планы изначально пустые)
+            return {
+              name: `${manager.LAST_NAME} ${manager.NAME}`,
+              calls: totalCalls,
+              calls_plan: "",
+              success_calls: successfulCalls,
+              success_calls_plan: "",
+              calls_time: totalCallDuration,
+              calls_time_plan: "",
+              not_sorted: newLeads,
+              not_sorted_plan: "",
+              otpravleno_kp: metricsValues[0],
+              otpravleno_kp_plan: "",
+              dogovor: metricsValues[1],
+              dogovor_plan: "",
+              razmeshenie: metricsValues[2],
+              razmeshenie_plan: "",
+              tech_training: metricsValues[3],
+              tech_training_plan: "",
+              first_sale: metricsValues[4],
+              first_sale_plan: "",
+              id: userID
+            };
+          });
+          this.items = await Promise.all(itemsPromises);
+          console.log("Итоговый отчет:", this.items);
+          this.updateTable(this.items);
+          this.setLiderPoints();
+        } catch (error) {
+          console.error('Ошибка загрузки отчёта:', error);
+        } finally {
+          document.getElementById('loader').style.display = 'none';
+        }
+      },
+    
+      updateTable(data) {
+        const tbody = document.getElementById('reportTable');
+        const fragment = document.createDocumentFragment();
+        data.forEach((item, index) => {
+          const row = document.createElement('tr');
+    
+          // Для каждого показателя формируем ячейку в виде "факт | план"
+          // Если пользователь имеет право редактировать, план отображается как contenteditable
+          const formatCell = (fact, plan, key) => {
+            if (allowedPlanEditors.includes(currentUserId)) {
+              return `<td>${fact} | <span contenteditable="true" data-index="${index}" data-key="${key}" class="plan-cell">${plan}</span></td>`;
+            } else {
+              return `<td>${fact} | ${plan || '-'}</td>`;
+            }
+          };
+    
+          row.innerHTML = `
+            <td>${item.name || '-'}</td>
+            ${formatCell(item.calls || 0, item.calls_plan, "calls")}
+            ${formatCell(item.success_calls || 0, item.success_calls_plan, "success_calls")}
+            ${formatCell(formatCallTime(item.calls_time), item.calls_time_plan, "calls_time")}
+            ${formatCell(item.not_sorted || 0, item.not_sorted_plan, "not_sorted")}
+            ${formatCell(item.otpravleno_kp || 0, item.otpravleno_kp_plan, "otpravleno_kp")}
+            ${formatCell(item.dogovor || 0, item.dogovor_plan, "dogovor")}
+            ${formatCell(item.razmeshenie || 0, item.razmeshenie_plan, "razmeshenie")}
+            ${formatCell(item.tech_training || 0, item.tech_training_plan, "tech_training")}
+            ${formatCell(item.first_sale || 0, item.first_sale_plan, "first_sale")}
+          `;
+          fragment.appendChild(row);
+        });
+        tbody.innerHTML = '';
+        tbody.appendChild(fragment);
+    
+        // Повесим обработчик событий на плановые ячейки
+        if (allowedPlanEditors.includes(currentUserId)) {
+          document.querySelectorAll('.plan-cell').forEach(cell => {
+            cell.addEventListener('blur', (e) => {
+              const newPlan = e.target.innerText.trim();
+              const rowIndex = e.target.getAttribute('data-index');
+              const key = e.target.getAttribute('data-key') + "_plan";
+              // Обновляем план в массиве данных
+              app.items[rowIndex][key] = newPlan;
+              console.log(`Обновлен план для строки ${rowIndex}, ключ ${key}: ${newPlan}`);
+              // Здесь можно вызвать API для сохранения изменений
+            });
+          });
+        }
+      },
+    
+      setLiderPoints() {
+        if (this.items && this.items.length) {
+          let callsLider = this.items.reduce((prev, cur) =>
+            Number(cur.calls_time) > Number(prev.calls_time) ? cur : prev, { calls_time: -Infinity });
+          if (callsLider && callsLider.calls_time > 0)
+            callsLider.liderPoints = (callsLider.liderPoints || 0) + 1;
+          let otpravlenoKpLider = this.items.reduce((prev, cur) =>
+            Number(cur.otpravleno_kp) > Number(prev.otpravleno_kp) ? cur : prev, { otpravleno_kp: -Infinity });
+          if (otpravlenoKpLider && otpravlenoKpLider.otpravleno_kp > 0)
+            otpravlenoKpLider.liderPoints = (otpravlenoKpLider.liderPoints || 0) + 1;
+          let successCallsLider = this.items.reduce((prev, cur) =>
+            Number(cur.success_calls) > Number(prev.success_calls) ? cur : prev, { success_calls: -Infinity });
+          if (successCallsLider && successCallsLider.success_calls > 0)
+            successCallsLider.liderPoints = (successCallsLider.liderPoints || 0) + 1;
+          console.log("Лидер по длительности звонков:", callsLider);
+          console.log("Лидер по отправленному КП:", otpravlenoKpLider);
+          console.log("Лидер по успешным звонкам:", successCallsLider);
+        }
+      }
+    };
+    
+    document.addEventListener('DOMContentLoaded', () => {
+      const urlParams = new URLSearchParams(window.location.search);
+      const authCode = urlParams.get('code');
+      app.init();
+    
+      // Пример обработки глобального плана для некоторых метрик
+      document.getElementById('setGlobalPlans').addEventListener('click', () => {
+        // Можно получить значения из глобальных полей и обновить соответствующие поля у всех элементов
+        const globalCallsPlan = document.getElementById('globalCallsPlan').value.trim();
+        const globalSuccessCallsPlan = document.getElementById('globalSuccessCallsPlan').value.trim();
+        app.items.forEach((item, index) => {
+          item.calls_plan = globalCallsPlan;
+          item.success_calls_plan = globalSuccessCallsPlan;
+        });
+        app.updateTable(app.items);
+        console.log("Глобальные планы установлены для всех по звонкам и успешным звонкам.");
+        // Здесь можно отправить запрос на сервер для массового обновления
+      });
+    });
+  </script>
+  
+  <style>
+    .report-wrapper {
+      display: flex;
+      justify-content: center;
+      padding: 20px;
+    }
+    .container {
+      max-width: 1200px;
+      width: 100%;
+      background: #fff;
+      border-radius: 10px;
+      box-shadow: 0px 4px 10px rgba(0,0,0,0.1);
+      padding: 20px;
+    }
+    @media (max-width: 576px) {
+      .container {
+        padding: 10px;
+      }
+    }
+  </style>
+</body>
+</html>
